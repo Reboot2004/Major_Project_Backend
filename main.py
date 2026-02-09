@@ -22,10 +22,32 @@ import albumentations as A
 from albumentations.pytorch import ToTensorV2
 import segmentation_models_pytorch as smp
 
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Form
 from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+import json
 import uvicorn
+from starlette.concurrency import run_in_threadpool
+
+# MongoDB
+from pymongo import MongoClient
+from bson import ObjectId
+
+# PDF Generation
+from reportlab.lib.pagesizes import letter, A4
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch, cm
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as RLImage, Table, TableStyle, PageBreak
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
+from reportlab.pdfgen import canvas
+from reportlab.lib.utils import ImageReader
+from reportlab.graphics import renderPM
+
+try:
+    from svglib.svglib import svg2rlg
+except ImportError:
+    svg2rlg = None
 
 # Import robust preprocessing and CAM functions
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'xai'))
@@ -73,6 +95,26 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ============================================================================
+# DATABASE (MongoDB)
+# ============================================================================
+
+# Allow env override; default points directly at the 'herhealth' database
+MONGO_URI = os.environ.get(
+    'MONGO_URI',
+    'mongodb+srv://knssriharshith:c3VY2EmB8RRUghE6@cluster0.lz5ln4u.mongodb.net/herhealth?retryWrites=true&w=majority&appName=Cluster0'
+)
+MONGO_DB_NAME = os.environ.get('MONGO_DB_NAME', 'herhealth')
+
+mongo_client: Optional[MongoClient] = None
+db = None
+try:
+    mongo_client = MongoClient(MONGO_URI)
+    db = mongo_client[MONGO_DB_NAME]
+    print(f"[BACKEND] ✓ Connected to MongoDB (db='{MONGO_DB_NAME}')")
+except Exception as e:
+    print(f"[BACKEND] ✗ WARNING: MongoDB connection failed: {e}")
 
 # ============================================================================
 # MODEL LOADING
@@ -385,6 +427,206 @@ async def health_check():
     }
 
 # ============================================================================
+# HISTORICAL PREDICTIONS (MongoDB)
+# ============================================================================
+
+def _format_prediction_doc(doc: dict) -> dict:
+    ts = doc.get("timestamp")
+    if isinstance(ts, datetime):
+        ts_str = ts.strftime("%Y-%m-%d %H:%M:%S")
+    else:
+        ts_str = str(ts) if ts is not None else None
+
+    return {
+        "id": str(doc.get("_id")) if doc.get("_id") is not None else None,
+        "patient_id": doc.get("patient_id"),
+        "patient_name": doc.get("patient_name"),
+        "kind": doc.get("kind"),
+        "model": doc.get("model"),
+        "xaiMethod": doc.get("xaiMethod"),
+        "magnification": doc.get("magnification"),
+        "classification": doc.get("classification"),
+        "probabilities": doc.get("probabilities"),
+        "quality": doc.get("quality"),
+        "uncertainty": doc.get("uncertainty"),
+        # Some earlier records may have stored uncertainty metrics under a
+        # different key; merge if present so the frontend always sees them.
+        "uncertainty_metrics": doc.get("uncertainty_metrics"),
+        "clinical_decision": doc.get("clinical_decision"),
+        "metrics": doc.get("metrics"),
+        "images": doc.get("images"),
+        "timestamp": ts_str,
+    }
+
+
+def _build_analysis_payload_from_record(record: dict) -> dict:
+    """Normalize a MongoDB prediction document into the analysis payload
+    expected by the PDF generator.
+
+    This helper makes the historical PDF routes robust to older documents
+    where some fields may be missing or stored under slightly different keys.
+    """
+
+    images = record.get("images", {}) or {}
+
+    # Prefer explicit segmentation mask if present; fall back to any
+    # older segmentation/overlay fields for backward compatibility.
+    seg_mask = (
+        images.get("segmentation_mask")
+        or images.get("segmentation")
+        or images.get("segmentation_overlay")
+    )
+
+    return {
+        "predicted_class": record.get("classification"),
+        "probabilities": record.get("probabilities", {}),
+        "original_image_base64": images.get("original"),
+        "xai_scorecam_base64": images.get("scorecam"),
+        "xai_layercam_base64": images.get("layercam"),
+        "segmentation_mask_base64": seg_mask,
+        "uncertainty": record.get("uncertainty")
+        or record.get("uncertainty_metrics", {}),
+        "metrics": record.get("metrics", {}),
+        "clinical_decision": record.get("clinical_decision", {}),
+        "quality": record.get("quality", {}),
+    }
+
+
+async def _store_prediction(doc: dict):
+    """Insert a prediction document into MongoDB, if available.
+
+    This is best-effort only and should never break the main inference flow.
+    """
+    if db is None:
+        return
+
+    def _insert():
+        db.predictions.insert_one(doc)
+
+    try:
+        await run_in_threadpool(_insert)
+    except Exception as e:
+        print(f"[BACKEND] Warning: failed to store prediction in MongoDB: {e}")
+
+@app.get("/api/oldpreds")
+async def list_old_predictions():
+    """Fetch all previous predictions sorted by latest timestamp.
+
+    If MongoDB is not available, this will gracefully return an empty list
+    instead of a 500 error so the frontend can still render the page.
+    """
+    try:
+        if db is None:
+            print("[BACKEND] /api/oldpreds requested but MongoDB is not initialized; returning empty list.")
+            return JSONResponse([])
+
+        def _fetch():
+            # Sort by the indexed _id field (which embeds creation time)
+            # and cap the result size to avoid large in-memory sorts.
+            return list(
+                db.predictions
+                .find()
+                .sort("_id", -1)
+                .limit(500)
+            )
+
+        preds = await run_in_threadpool(_fetch)
+        result = [_format_prediction_doc(p) for p in preds]
+        return JSONResponse(result)
+    except Exception as e:
+        print(f"[BACKEND] /api/oldpreds error: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+@app.get("/api/oldpreds/{id}")
+async def get_old_prediction(id: str):
+    """Fetch a previous prediction by its ObjectId."""
+    try:
+        if db is None:
+            raise HTTPException(status_code=500, detail="Database is not initialized")
+
+        try:
+            oid = ObjectId(id)
+        except Exception:
+            return JSONResponse({"error": "Invalid id format"}, status_code=400)
+
+        def _fetch_one():
+            return db.predictions.find_one({"_id": oid})
+
+        record = await run_in_threadpool(_fetch_one)
+        if not record:
+            return JSONResponse({"error": "Record not found"}, status_code=404)
+
+        return JSONResponse(_format_prediction_doc(record))
+    except HTTPException:
+        raise
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/oldpreds/{id}/report")
+async def download_old_prediction_report(id: str):
+    """Generate and download a detailed PDF report for a stored prediction.
+
+    This uses the same PDF generator as the live analysis endpoint, but
+    reconstructs the analysis payload from the MongoDB document so the
+    frontend can download a full report with a single click.
+    """
+    try:
+        if db is None:
+            raise HTTPException(status_code=500, detail="Database is not initialized")
+
+        try:
+            oid = ObjectId(id)
+        except Exception:
+            return JSONResponse({"error": "Invalid id format"}, status_code=400)
+
+        def _fetch_one():
+            return db.predictions.find_one({"_id": oid})
+
+        record = await run_in_threadpool(_fetch_one)
+        if not record:
+            return JSONResponse({"error": "Record not found"}, status_code=404)
+
+        # Normalize record into the analysis payload expected by generate_pdf_report
+        analysis_data = _build_analysis_payload_from_record(record)
+
+        patient_metadata = {
+            "patient_id": record.get("patient_id"),
+            "patient_name": record.get("patient_name", "Anonymous"),
+            "analysis_date": record.get("timestamp", datetime.utcnow()).strftime("%Y-%m-%d")
+            if isinstance(record.get("timestamp"), datetime)
+            else datetime.utcnow().strftime("%Y-%m-%d"),
+        }
+
+        # Dummy file object used only for filename metadata in the PDF
+        class _DummyFile:
+            filename = "stored_image.png"
+
+        pdf_buffer = generate_pdf_report(analysis_data, patient_metadata, _DummyFile())
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        patient_part = (
+            str(patient_metadata.get("patient_id", "unknown")).replace(" ", "_")
+            if patient_metadata.get("patient_id")
+            else "anonymous"
+        )
+        filename = f"herhealth_analysis_{patient_part}_{timestamp}.pdf"
+
+        return StreamingResponse(
+            io.BytesIO(pdf_buffer.read()),
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": f"attachment; filename={filename}",
+                "Content-Type": "application/pdf",
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[BACKEND] Historical PDF generation error: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+# ============================================================================
 # CLASSIFICATION ENDPOINTS
 # ============================================================================
 
@@ -394,7 +636,11 @@ async def get_classes():
     return CLASSES
 
 @app.post("/api/v1/classification/predict")
-async def classify(file: UploadFile = File(...)):
+async def classify(
+    file: UploadFile = File(...),
+    patient_id: Optional[str] = Form(None),
+    patient_name: Optional[str] = Form(None),
+):
     """Classify with complete preprocessing pipeline and robust XAI"""
     try:
         start_time = time.time()
@@ -451,6 +697,40 @@ async def classify(file: UploadFile = File(...)):
         if not scorecam_b64:
             scorecam_b64 = layercam_b64
         
+        # Generate segmentation mask (no overlay) for comprehensive analysis
+        segmentation_b64 = None
+        seg_metrics = {}
+        if UNET_LOADED:
+            try:
+                print(f"[BACKEND] Generating segmentation mask...")
+                aug = seg_transform(image=stain_normalized)
+                img_tensor_seg = aug['image'].unsqueeze(0).to(DEVICE)
+
+                with torch.no_grad():
+                    mask_logits = unet_model(img_tensor_seg)
+                    pred_mask = mask_logits.argmax(1).squeeze().cpu().numpy().astype(np.uint8)
+
+                # Resize mask to original image size
+                pred_mask_resized = cv2.resize(
+                    pred_mask.astype(np.uint8),
+                    (stain_normalized.shape[1], stain_normalized.shape[0]),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+
+                # Colorize mask (pure mask image, no blending with stain-normalized image)
+                color_map = np.array([[0, 0, 0], [255, 0, 0], [0, 255, 0]], dtype=np.uint8)
+                mask_colored = color_map[pred_mask_resized]
+                segmentation_b64 = image_to_base64(mask_colored)
+
+                # Calculate segmentation metrics
+                seg_metrics = calculate_metrics(pred_mask_resized)
+                print(f"[BACKEND] Segmentation generated: {seg_metrics['num_cells']} cells detected")
+
+            except Exception as seg_error:
+                print(f"[BACKEND] Segmentation generation failed: {seg_error}")
+                segmentation_b64 = None
+                seg_metrics = {}
+        
         # Robust uncertainty estimation with MC Dropout
         try:
             print(f"[BACKEND] Estimating uncertainty...")
@@ -475,14 +755,82 @@ async def classify(file: UploadFile = File(...)):
         processing_time_ms = int((time.time() - start_time) * 1000)
         
         print(f"[BACKEND] Classification complete in {processing_time_ms}ms")
+
+        probabilities_dict = {CLASSES[i]: float(probs[i]) for i in range(len(CLASSES))}
+
+        # Generate clinical decision support
+        pred_prob = float(probs[pred_class])
+        risk_mapping = {
+            'Dyskeratotic': 'high',
+            'Koilocytotic': 'high',
+            'Metaplastic': 'moderate',
+            'Parabasal': 'low',
+            'Superficial-Intermediate': 'low'
+        }
+        risk_level = risk_mapping.get(CLASSES[pred_class], 'moderate')
         
+        # Risk score combines prediction confidence with segmentation quality if available
+        seg_confidence = seg_metrics.get('accuracy', 1.0) if seg_metrics else 1.0
+        risk_score = int(pred_prob * seg_confidence * 100)
+        
+        # Generate recommendations based on risk level and metrics
+        recommendations = []
+        if pred_prob < 0.75:
+            recommendations.append("Consider additional testing or expert review due to moderate confidence.")
+        if seg_metrics.get('coverage_ratio', 1.0) < 0.3:
+            recommendations.append("Image quality or cell coverage may affect accuracy - consider retake.")
+        if risk_level == 'high':
+            recommendations.append("Schedule urgent clinical follow-up and additional cytological assessment.")
+        elif risk_level == 'moderate':
+            recommendations.append("Schedule routine follow-up within 6-12 months.")
+        if not recommendations:
+            recommendations.append("Continue routine screening as per clinical guidelines.")
+        
+        clinical_decision = {
+            'risk_level': risk_level,
+            'risk_score': risk_score,
+            'primary_class': CLASSES[pred_class],
+            'secondary_candidates': [
+                {'class': CLASSES[i], 'probability': float(probs[i])}
+                for i in range(len(CLASSES)) if i != pred_class
+            ][:3],
+            'recommendations': recommendations,
+            'needs_review': bool(pred_prob < 0.75 or seg_metrics.get('accuracy', 1.0) < 0.75),
+            'review_reason': 'Low confidence or poor segmentation quality' if pred_prob < 0.75 or seg_metrics.get('accuracy', 1.0) < 0.75 else None
+        }
+
+        # Best-effort: store prediction in MongoDB (including segmentation mask if available)
+        doc = {
+            'kind': 'classification',
+            'model': 'ConvNeXt-Tiny',
+            'xaiMethod': 'Score-CAM + Layer-CAM',
+            'magnification': None,
+            'classification': CLASSES[pred_class],
+            'probabilities': probabilities_dict,
+            'quality': preprocessing['quality'],
+            'uncertainty': uncertainty_metrics,
+            'images': {
+                'original': original_b64,
+                'segmentation': segmentation_b64,
+                'scorecam': scorecam_b64,
+                'layercam': layercam_b64,
+            },
+            'timestamp': datetime.utcnow(),
+        }
+        doc['patient_id'] = patient_id
+        doc['patient_name'] = patient_name
+        await _store_prediction(doc)
+
         return JSONResponse({
             'predicted_class': CLASSES[pred_class],
-            'probabilities': {CLASSES[i]: float(probs[i]) for i in range(len(CLASSES))},
+            'probabilities': probabilities_dict,
             'xai_scorecam_base64': scorecam_b64,
             'xai_layercam_base64': layercam_b64,
             'original_image_base64': original_b64,
+            'segmentation_mask_base64': segmentation_b64,
+            'metrics': seg_metrics,
             'uncertainty': uncertainty_metrics,
+            'clinical_decision': clinical_decision,
             'preprocessing': {
                 'quality_score': preprocessing['quality']['score'],
                 'quality_flags': preprocessing['quality']['flags'],
@@ -504,7 +852,11 @@ async def classify(file: UploadFile = File(...)):
 # ============================================================================
 
 @app.post("/api/v1/segmentation/predict")
-async def segment(file: UploadFile = File(...)):
+async def segment(
+    file: UploadFile = File(...),
+    patient_id: Optional[str] = Form(None),
+    patient_name: Optional[str] = Form(None),
+):
     """Segment and classify a single image with preprocessing pipeline and proper metrics"""
     try:
         start_time = time.time()
@@ -545,13 +897,10 @@ async def segment(file: UploadFile = File(...)):
         pred_mask_resized = cv2.resize(pred_mask.astype(np.uint8), (stain_normalized.shape[1], stain_normalized.shape[0]), 
                                        interpolation=cv2.INTER_NEAREST)
         
-        # Colorize mask with proper visualization
+        # Colorize mask with proper visualization (pure mask, no overlay)
         color_map = np.array([[0, 0, 0], [255, 0, 0], [0, 255, 0]], dtype=np.uint8)
         mask_colored = color_map[pred_mask_resized]
-        
-        # Blend mask with stain-normalized image for better visualization
-        mask_overlay = cv2.addWeighted(stain_normalized, 0.7, mask_colored, 0.3, 0)
-        mask_b64 = image_to_base64(mask_overlay)
+        mask_b64 = image_to_base64(mask_colored)
         
         # Calculate dynamic metrics
         metrics = calculate_metrics(pred_mask_resized)
@@ -623,10 +972,59 @@ async def segment(file: UploadFile = File(...)):
             recommendations.append('Routine screening sufficient')
         
         processing_time_ms = int((time.time() - start_time) * 1000)
-        
+
+        probabilities_dict = {CLASSES[i]: float(probs[i]) for i in range(len(CLASSES))}
+
+        # Best-effort: store combined segmentation + classification prediction
+        seg_uncertainty = {
+            'confidence': float(pred_prob * 100),
+            'entropy': entropy,
+            'confidence_score': confidence_score,
+            'segmentation_confidence': seg_confidence,
+            'combined_confidence': combined_confidence,
+            'uncertainty_lower': uncertainty_lower,
+            'uncertainty_upper': uncertainty_upper,
+            'prediction_stability': prediction_stability
+        }
+        clinical_decision = {
+            'risk_level': risk_level,
+            'risk_score': risk_score,
+            'primary_class': CLASSES[pred_class],
+            'secondary_candidates': [
+                {'class': CLASSES[i], 'probability': float(probs[i])}
+                for i in range(len(CLASSES)) if i != pred_class
+            ][:3],
+            'recommendations': recommendations,
+            'needs_review': bool(pred_prob < 0.75 or metrics['accuracy'] < 0.75),
+            'review_reason': 'Low confidence or poor segmentation quality' if pred_prob < 0.75 or metrics['accuracy'] < 0.75 else None
+        }
+
+        doc = {
+            'kind': 'segmentation',
+            'model': 'ConvNeXt-Tiny + U-Net',
+            'xaiMethod': 'Score-CAM + Layer-CAM',
+            'magnification': None,
+            'classification': CLASSES[pred_class],
+            'probabilities': probabilities_dict,
+            'quality': preprocessing['quality'],
+            'metrics': metrics,
+            'uncertainty': seg_uncertainty,
+            'clinical_decision': clinical_decision,
+            'images': {
+                'original': original_b64,
+                'segmentation': mask_b64,
+                'scorecam': scorecam_b64,
+                'layercam': layercam_b64,
+            },
+            'timestamp': datetime.utcnow(),
+        }
+        doc['patient_id'] = patient_id
+        doc['patient_name'] = patient_name
+        await _store_prediction(doc)
+
         return JSONResponse({
             'predicted_class': CLASSES[pred_class],
-            'probabilities': {CLASSES[i]: float(probs[i]) for i in range(len(CLASSES))},
+            'probabilities': probabilities_dict,
             'segmentation_mask_base64': mask_b64,
             'xai_scorecam_base64': scorecam_b64,
             'xai_layercam_base64': layercam_b64,
@@ -639,28 +1037,8 @@ async def segment(file: UploadFile = File(...)):
                 'session_id': session_id
             },
             'metrics': metrics,
-            'uncertainty': {
-                'confidence': float(pred_prob * 100),
-                'entropy': entropy,
-                'confidence_score': confidence_score,
-                'segmentation_confidence': seg_confidence,
-                'combined_confidence': combined_confidence,
-                'uncertainty_lower': uncertainty_lower,
-                'uncertainty_upper': uncertainty_upper,
-                'prediction_stability': prediction_stability
-            },
-            'clinical_decision': {
-                'risk_level': risk_level,
-                'risk_score': risk_score,
-                'primary_class': CLASSES[pred_class],
-                'secondary_candidates': [
-                    {'class': CLASSES[i], 'probability': float(probs[i])}
-                    for i in range(len(CLASSES)) if i != pred_class
-                ][:3],
-                'recommendations': recommendations,
-                'needs_review': bool(pred_prob < 0.75 or metrics['accuracy'] < 0.75),
-                'review_reason': 'Low confidence or poor segmentation quality' if pred_prob < 0.75 or metrics['accuracy'] < 0.75 else None
-            },
+            'uncertainty': seg_uncertainty,
+            'clinical_decision': clinical_decision,
             'processing_time_ms': processing_time_ms,
             'model_version': 'v2.0.0'
         })
@@ -893,114 +1271,589 @@ async def batch_process(files: List[UploadFile] = File(...)):
 # ============================================================================
 
 # ============================================================================
-# REPORT GENERATION
+# REPORT GENERATION (PDF)
 # ============================================================================
 
-@app.post("/api/v1/generate-report")
-async def generate_report(file: UploadFile = File(...)):
-    """Generate comprehensive analysis report"""
+def create_pdf_header(canvas, doc, report_title="HerHealth.AI Analysis Report"):
+    """Create professional PDF header with logo and aligned title block.
+
+    The header occupies the margin band above the main content frame so that
+    it never overlaps tables or images on any page.
+    """
+    canvas.saveState()
+
+    page_width, _page_height = canvas._pagesize  # full page width
+
+    # Position the header directly above the main content frame
+    header_height = 80
+    frame_top = doc.bottomMargin + doc.height
+    bar_y = frame_top
+
+    # Header background bar spans the full page width
+    canvas.setFillColor(colors.HexColor('#2563eb'))
+    canvas.rect(0, bar_y, page_width, header_height, stroke=0, fill=1)
+
+    # Try to draw branded logo if available, otherwise fall back to text logo
+    logo_drawn = False
     try:
-        # Process image with both classification and segmentation
-        image_data = await file.read()
-        img = Image.open(io.BytesIO(image_data)).convert('RGB')
-        img_np = np.array(img)
-        
-        # Run full preprocessing pipeline
-        session_id = str(uuid.uuid4())
-        preprocessing = preprocess_image_pipeline(img_np, session_id)
-        img_normalized = preprocessing['stain_normalized']
-        
-        # Classification
-        img_pil = Image.fromarray(img_normalized)
-        img_tensor_cls = cls_transform(img_pil).to(DEVICE)
-        
-        with torch.no_grad():
-            logits = convnext_model(img_tensor_cls.unsqueeze(0))
-            probs = torch.softmax(logits, dim=1)[0]
-            pred_class = probs.argmax().item()
-        
-        # Segmentation
-        aug = seg_transform(image=img_normalized)
-        img_tensor_seg = aug['image'].unsqueeze(0).to(DEVICE)
-        with torch.no_grad():
-            mask_logits = unet_model(img_tensor_seg)
-            pred_mask = mask_logits.argmax(1).squeeze().cpu().numpy().astype(np.uint8)
-        
-        # Calculate metrics
-        metrics = calculate_metrics(pred_mask)
-        pred_prob = float(probs[pred_class])
-        entropy = float(-torch.sum(probs * torch.log(probs + 1e-10)).item())
-        max_entropy = float(np.log(len(CLASSES)))
-        confidence_score = 1.0 - (entropy / max_entropy)
-        
-        # XAI insights based on actual metrics
-        xai_insights = []
-        if metrics['nucleus_iou'] > 0.7:
-            xai_insights.append("Clear nucleus detection with high confidence")
-        else:
-            xai_insights.append("Nucleus segmentation quality is moderate - review recommended")
-        
-        if metrics['cytoplasm_iou'] > 0.7:
-            xai_insights.append("Well-defined cytoplasm boundaries")
-        else:
-            xai_insights.append("Cytoplasm definition is unclear - consider image preprocessing")
-        
-        if CLASSES[pred_class] in ['Dyskeratotic', 'Koilocytotic']:
-            xai_insights.append("High-risk morphology detected - HPV-related changes present")
-        elif CLASSES[pred_class] == 'Metaplastic':
-            xai_insights.append("Benign metaplastic changes detected")
-        
-        # Risk-based recommendations
-        risk_mapping = {
-            'Dyskeratotic': 'high',
-            'Koilocytotic': 'high',
-            'Metaplastic': 'moderate',
-            'Parabasal': 'low',
-            'Superficial-Intermediate': 'low'
-        }
-        risk_level = risk_mapping.get(CLASSES[pred_class], 'moderate')
-        
-        recommendations = []
-        if pred_prob < 0.75:
-            recommendations.append("Expert review strongly recommended - low model confidence")
-        if metrics['accuracy'] < 0.75:
-            recommendations.append("Segmentation quality concern - consider re-imaging")
-        
-        if risk_level == 'high':
-            recommendations.append("Follow-up cytology recommended within 3-6 months")
-            recommendations.append("Consider HPV testing if not already performed")
-        elif risk_level == 'moderate':
-            recommendations.append("Routine follow-up recommended")
-        else:
-            recommendations.append("Standard screening intervals appropriate")
-        
-        return JSONResponse({
-            'report_id': str(uuid.uuid4()),
-            'patient_id': 'ANON-' + str(uuid.uuid4())[:8].upper(),
-            'analysis_date': datetime.now().isoformat(),
-            'image_filename': file.filename,
-            'primary_diagnosis': CLASSES[pred_class],
-            'confidence': float(pred_prob * 100),
-            'confidence_score': confidence_score,
-            'segmentation_metrics': metrics,
-            'risk_level': risk_level,
-            'xai_insights': xai_insights,
-            'recommendations': recommendations,
-            'model_version': 'v2.0.0'
-        })
+        logo_path = os.environ.get(
+            "HERHEALTH_LOGO_PATH",
+            os.path.join(os.path.dirname(__file__), "her_health_logo.jpeg"),
+        )
+
+        if os.path.exists(logo_path):
+            ext = os.path.splitext(logo_path)[1].lower()
+
+            # If SVG and svglib is available, rasterize to PNG in-memory
+            if ext == ".svg" and svg2rlg is not None:
+                drawing = svg2rlg(logo_path)
+                png_bytes = renderPM.drawToString(drawing, fmt="PNG")
+                logo_img = ImageReader(io.BytesIO(png_bytes))
+            else:
+                # Fallback for PNG/JPEG or when svglib is not installed
+                logo_img = ImageReader(logo_path)
+
+            logo_width = 140
+            logo_height = 36
+            logo_y = bar_y + (header_height - logo_height) / 2
+            canvas.drawImage(
+                logo_img,
+                30,
+                logo_y,
+                width=logo_width,
+                height=logo_height,
+                mask="auto",
+            )
+            logo_drawn = True
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"[BACKEND] PDF header logo load failed: {e}")
+
+    canvas.setFillColor(colors.white)
+    if not logo_drawn:
+        # Text fallback logo styled to resemble the product branding
+        primary_y = bar_y + header_height - 30
+        secondary_y = bar_y + 16
+
+        canvas.setFont("Helvetica-Bold", 22)
+        canvas.drawString(30, primary_y, "HerHealth.AI")
+
+        canvas.setFont("Helvetica", 11)
+        canvas.drawString(30, secondary_y, "Cervical Cancer Screening with AI")
+
+    # Right-aligned report metadata block (title + subtitle + timestamp)
+    right_x = doc.width + doc.leftMargin - 30
+
+    title_y = bar_y + header_height - 26
+    subtitle_y = bar_y + header_height - 44
+    date_y = bar_y + 16
+
+    canvas.setFont("Helvetica-Bold", 13)
+    canvas.drawRightString(right_x, title_y, report_title)
+
+    canvas.setFont("Helvetica", 11)
+    canvas.drawRightString(right_x, subtitle_y, "AI-assisted cytology report")
+
+    canvas.setFont("Helvetica", 9)
+    canvas.drawRightString(right_x, date_y, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+    canvas.restoreState()
+
+def create_pdf_footer(canvas, doc):
+    """Create PDF footer with page numbers and disclaimer"""
+    canvas.saveState()
+    
+    # Footer line
+    canvas.setStrokeColor(colors.HexColor('#e5e7eb'))
+    canvas.line(30, 50, doc.width + doc.leftMargin - 30, 50)
+    
+    # Page number
+    canvas.setFont("Helvetica", 9)
+    canvas.drawString(30, 35, f"Page {doc.page}")
+    
+    # Disclaimer
+    canvas.setFont("Helvetica", 8)
+    disclaimer = "This is an AI-generated analysis for research purposes. Clinical decisions should involve professional medical review."
+    # ReportLab uses drawCentredString (US spelling) on Canvas
+    canvas.drawCentredString(doc.width / 2 + doc.leftMargin, 20, disclaimer)
+    
+    canvas.restoreState()
+
+def base64_to_image(base64_string, max_width=400, max_height=300):
+    """Convert base64 string to ReportLab Image object with size constraints"""
+    try:
+        if base64_string.startswith('data:'):
+            base64_string = base64_string.split(',')[1]
+        
+        img_data = base64.b64decode(base64_string)
+        img = Image.open(io.BytesIO(img_data))
+        
+        # Calculate scaling to fit within max dimensions
+        width, height = img.size
+        scale_w = max_width / width if width > max_width else 1
+        scale_h = max_height / height if height > max_height else 1
+        scale = min(scale_w, scale_h)
+        
+        new_width = int(width * scale)
+        new_height = int(height * scale)
+        
+        img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+        
+        # Convert to RGB if necessary
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
+        
+        # Save to BytesIO
+        img_buffer = io.BytesIO()
+        img.save(img_buffer, format='PNG')
+        img_buffer.seek(0)
+        # RLImage can take a file-like object directly
+        return RLImage(img_buffer, width=new_width, height=new_height)
+    except Exception as e:
+        print(f"Error converting base64 to image: {e}")
+        return None
+
+def generate_pdf_report(analysis_data, patient_metadata, original_image_file):
+    """Generate comprehensive PDF report with all analysis components"""
+    buffer = io.BytesIO()
+    
+    # Create PDF document
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        rightMargin=72,
+        leftMargin=72,
+        topMargin=100,
+        bottomMargin=72
+    )
+    
+    # Styles
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        'CustomTitle',
+        parent=styles['Heading1'],
+        fontSize=18,
+        spaceAfter=20,
+        textColor=colors.HexColor('#1f2937'),
+        alignment=TA_CENTER
+    )
+    
+    heading_style = ParagraphStyle(
+        'CustomHeading',
+        parent=styles['Heading2'],
+        fontSize=14,
+        spaceAfter=12,
+        textColor=colors.HexColor('#2563eb'),
+        borderWidth=1,
+        borderColor=colors.HexColor('#e5e7eb'),
+        borderPadding=8,
+        backColor=colors.HexColor('#f8fafc')
+    )
+    
+    normal_style = styles['Normal']
+    normal_style.fontSize = 10
+    normal_style.spaceAfter = 6
+    
+    # Story elements
+    story = []
+    
+    # Title
+    story.append(Paragraph("Cervical Cell Analysis Report", title_style))
+    story.append(Spacer(1, 20))
+    
+    # Patient Information Section
+    story.append(Paragraph("Patient Information", heading_style))
+    
+    patient_data = [
+        ['Patient ID:', patient_metadata.get('patient_id', 'N/A')],
+        ['Patient Name:', patient_metadata.get('patient_name', 'Anonymous')],
+        ['Analysis Date:', patient_metadata.get('analysis_date', datetime.now().strftime('%Y-%m-%d'))],
+        ['Image Filename:', original_image_file.filename if hasattr(original_image_file, 'filename') else 'N/A'],
+        ['Model Version:', 'v2.0.0']
+    ]
+    
+    patient_table = Table(patient_data, colWidths=[2*inch, 3*inch])
+    patient_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#f3f4f6')),
+        ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
+        ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+        ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+        ('FONTNAME', (1, 0), (1, -1), 'Helvetica'),
+        ('FONTSIZE', (0, 0), (-1, -1), 10),
+        ('GRID', (0, 0), (-1, -1), 1, colors.HexColor('#e5e7eb')),
+        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+        ('ROWBACKGROUNDS', (0, 0), (-1, -1), [colors.white, colors.HexColor('#f9fafb')]),
+    ]))
+    
+    story.append(patient_table)
+    story.append(Spacer(1, 20))
+    
+    # Classification Results
+    story.append(Paragraph("Classification Result", heading_style))
+
+    predicted_class = analysis_data.get('predicted_class', 'Unknown')
+    probabilities = analysis_data.get('probabilities', {}) or {}
+
+    story.append(Paragraph(f"<b>Primary Diagnosis:</b> {predicted_class}", normal_style))
+    story.append(Spacer(1, 6))
+
+    # Probability distribution table
+    prob_data = [['Cell Type', 'Model Confidence']]
+    for class_name, prob in probabilities.items():
+        prob_data.append([class_name, f"{prob:.2%}"])
+    
+    prob_table = Table(prob_data, colWidths=[2.5*inch, 1.5*inch])
+    prob_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#2563eb')),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+        ('FONTSIZE', (0, 0), (-1, -1), 10),
+        ('GRID', (0, 0), (-1, -1), 1, colors.HexColor('#e5e7eb')),
+        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f9fafb')]),
+    ]))
+    
+    story.append(prob_table)
+    story.append(Spacer(1, 10))
+
+    # Brief interpretation guide for classification
+    classification_interp = """
+    <b>Interpretation:</b><br/>
+    • Highest confidence cell type = primary diagnosis (decision support only).
+    """
+    story.append(Paragraph(classification_interp, normal_style))
+    story.append(Spacer(1, 20))
+    
+    # Images Section
+    story.append(Paragraph("Image & Explainability Analysis", heading_style))
+
+    images_block = analysis_data.get('images', {}) or {}
+
+    # Base64 sources
+    original_b64 = analysis_data.get('original_image_base64') or images_block.get('original')
+    scorecam_b64 = analysis_data.get('xai_scorecam_base64') or images_block.get('scorecam')
+    layercam_b64 = analysis_data.get('xai_layercam_base64') or images_block.get('layercam')
+
+    # Build a 3-column grid: Original | ScoreCAM | LayerCAM
+    if original_b64 or scorecam_b64 or layercam_b64:
+        images_row = []
+        labels_row = []
+
+        # Use consistent target size so all three images align properly
+        target_width = 1.8 * inch
+        target_height = 1.8 * inch
+
+        # Original image
+        if original_b64:
+            orig_img = base64_to_image(original_b64, max_width=170, max_height=170)
+            if orig_img:
+                orig_img.drawWidth = target_width
+                orig_img.drawHeight = target_height
+            images_row.append(orig_img or "")
+            labels_row.append(Paragraph("<b>Original Image</b>", normal_style))
+        else:
+            images_row.append("")
+            labels_row.append("")
+
+        # Score-CAM
+        if scorecam_b64:
+            scorecam_img = base64_to_image(scorecam_b64, max_width=170, max_height=170)
+            if scorecam_img:
+                scorecam_img.drawWidth = target_width
+                scorecam_img.drawHeight = target_height
+            images_row.append(scorecam_img or "")
+            labels_row.append(Paragraph("<b>ScoreCAM</b>", normal_style))
+        else:
+            images_row.append("")
+            labels_row.append("")
+
+        # Layer-CAM
+        if layercam_b64:
+            layercam_img = base64_to_image(layercam_b64, max_width=170, max_height=170)
+            if layercam_img:
+                layercam_img.drawWidth = target_width
+                layercam_img.drawHeight = target_height
+            images_row.append(layercam_img or "")
+            labels_row.append(Paragraph("<b>LayerCAM</b>", normal_style))
+        else:
+            images_row.append("")
+            labels_row.append("")
+
+        img_table = Table([images_row, labels_row], colWidths=[target_width, target_width, target_width])
+        img_table.setStyle(TableStyle([
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('VALIGN', (0, 0), (-1, 0), 'MIDDLE'),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 6),
+            ('TOPPADDING', (0, 1), (-1, 1), 4),
+        ]))
+
+        story.append(img_table)
+        story.append(Spacer(1, 10))
+
+        xai_interp = """
+        <b>Interpretation:</b><br/>
+        • ScoreCAM/LayerCAM highlight regions that most influenced the model.<br/>
+        • Use highlighted areas to check if the model focuses on true cellular structures.
+        """
+        story.append(Paragraph(xai_interp, normal_style))
+        story.append(Spacer(1, 15))
+
+    story.append(PageBreak())
+    
+    # Uncertainty & Confidence Analysis
+    uncertainty = analysis_data.get('uncertainty', {}) or {}
+    if uncertainty:
+        story.append(Paragraph("Confidence & Uncertainty Analysis", heading_style))
+
+        raw_conf = uncertainty.get('confidence', 0)
+        # Normalize confidence – accept either 0-1 or 0-100
+        if raw_conf > 1:
+            confidence = float(raw_conf)
+        else:
+            confidence = float(raw_conf) * 100.0
+
+        entropy = float(uncertainty.get('entropy', uncertainty.get('entropy_normalized', 0.0)) or 0.0)
+        stability = float(uncertainty.get('prediction_stability', uncertainty.get('overall_uncertainty', 0.0)) or 0.0)
+
+        uncertainty_data = [
+            ['Metric', 'Value', 'Interpretation'],
+            ['Confidence Score', f"{confidence:.1f}%", 'High' if confidence > 80 else 'Moderate' if confidence > 60 else 'Low'],
+            ['Prediction Entropy', f"{entropy:.3f}", 'Low' if entropy < 0.5 else 'Moderate' if entropy < 1.0 else 'High'],
+            ['Model Stability', f"{stability}%", 'Stable' if stability > 70 else 'Moderate' if stability > 50 else 'Unstable']
+        ]
+        
+        uncertainty_table = Table(uncertainty_data, colWidths=[2*inch, 1.5*inch, 1.5*inch])
+        uncertainty_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#2563eb')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+            ('FONTSIZE', (0, 0), (-1, -1), 10),
+            ('GRID', (0, 0), (-1, -1), 1, colors.HexColor('#e5e7eb')),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f9fafb')]),
+        ]))
+        
+        story.append(uncertainty_table)
+        story.append(Spacer(1, 8))
+
+        uncertainty_interp = """
+        <b>Interpretation:</b><br/>
+        • &gt; 80% confidence → usable result.<br/>
+        • 60–80% confidence → moderate risk, review with caution.
+        """
+        story.append(Paragraph(uncertainty_interp, normal_style))
+        story.append(Spacer(1, 20))
+
+    # Clinical Decision Support
+    clinical_decision = analysis_data.get('clinical_decision', {}) or {}
+    if clinical_decision:
+        story.append(Paragraph("Clinical Decision Support", heading_style))
+        
+        risk_level = clinical_decision.get('risk_level', 'moderate')
+        risk_score = clinical_decision.get('risk_score', 0)
+        needs_review = clinical_decision.get('needs_review', False)
+        
+        # Risk assessment
+        story.append(Paragraph(f"<b>Risk Level:</b> {risk_level.title()}", normal_style))
+        story.append(Paragraph(f"<b>Risk Score:</b> {risk_score:.1f}/100", normal_style))
+        story.append(Paragraph(f"<b>Requires Review:</b> {'Yes' if needs_review else 'No'}", normal_style))
+        story.append(Spacer(1, 10))
+        
+        # Recommendations
+        recommendations = clinical_decision.get('recommendations', [])
+        if recommendations:
+            story.append(Paragraph("<b>Clinical Recommendations:</b>", normal_style))
+            for i, rec in enumerate(recommendations, 1):
+                story.append(Paragraph(f"{i}. {rec}", normal_style))
+            story.append(Spacer(1, 15))
+        
+        # Secondary candidates
+        secondary = clinical_decision.get('secondary_candidates', [])
+        if secondary:
+            story.append(Paragraph("<b>Alternative Diagnoses (Differential):</b>", normal_style))
+            
+            diff_data = [['Cell Type', 'Probability']]
+            for candidate in secondary[:3]:  # Top 3 alternatives
+                class_name = candidate.get('class', 'Unknown')
+                prob = candidate.get('probability', 0)
+                diff_data.append([class_name, f"{prob:.2%}"])
+            
+            diff_table = Table(diff_data, colWidths=[2.5*inch, 1.5*inch])
+            diff_table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#dc2626')),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+                ('FONTSIZE', (0, 0), (-1, -1), 10),
+                ('GRID', (0, 0), (-1, -1), 1, colors.HexColor('#e5e7eb')),
+                ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#fef2f2')]),
+            ]))
+            
+            story.append(diff_table)
+            story.append(Spacer(1, 8))
+
+        clinical_interp = """
+        <b>Interpretation:</b><br/>
+        • Risk level/score summarize how concerning the pattern is.<br/>
+        • Follow model recommendations as decision support, not final diagnosis.
+        """
+        story.append(Paragraph(clinical_interp, normal_style))
+        story.append(Spacer(1, 20))
+    
+    # Footer disclaimer – keep a bit of spacing but avoid forcing
+    # an unnecessary extra page when content is long.
+    story.append(Spacer(1, 12))
+    disclaimer_style = ParagraphStyle(
+        'Disclaimer',
+        parent=styles['Normal'],
+        fontSize=9,
+        textColor=colors.HexColor('#6b7280'),
+        borderWidth=1,
+        borderColor=colors.HexColor('#fbbf24'),
+        borderPadding=10,
+        backColor=colors.HexColor('#fff7ed'),
+        alignment=TA_CENTER
+    )
+    
+    disclaimer_text = """
+    <b>IMPORTANT CLINICAL DISCLAIMER:</b><br/>
+    This AI-generated report is for research and educational purposes only. All diagnostic decisions
+    should be made by qualified healthcare professionals in consultation with clinical history,
+    physical examination, and additional testing as appropriate. This system is not intended
+    to replace professional medical judgment or clinical correlation.
+    """
+    
+    story.append(Paragraph(disclaimer_text, disclaimer_style))
+    
+    # Build PDF with custom header/footer
+    def add_page_elements(canvas, doc):
+        create_pdf_header(canvas, doc)
+        create_pdf_footer(canvas, doc)
+    
+    doc.build(story, onFirstPage=add_page_elements, onLaterPages=add_page_elements)
+    
+    buffer.seek(0)
+    return buffer
+
+@app.post("/api/v1/generate-report")
+async def generate_report(
+    file: UploadFile = File(...),
+    analysis: str = Form(...),
+):
+    """Generate a comprehensive PDF analysis report with all model outputs and patient details"""
+    try:
+        # Parse analysis data
+        try:
+            analysis_data = json.loads(analysis)
+        except Exception as parse_error:
+            raise HTTPException(status_code=400, detail=f"Invalid analysis payload: {parse_error}")
+
+        # Extract patient metadata
+        patient_metadata = {
+            'patient_id': analysis_data.get('patient_id'),
+            'patient_name': analysis_data.get('patient_name', 'Anonymous'),
+            'analysis_date': analysis_data.get('analysis_date', datetime.now().strftime('%Y-%m-%d'))
+        }
+
+        # Generate PDF report
+        pdf_buffer = generate_pdf_report(analysis_data, patient_metadata, file)
+        
+        # Create filename with timestamp
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        patient_part = patient_metadata.get('patient_id', 'unknown').replace(' ', '_') if patient_metadata.get('patient_id') else 'anonymous'
+        filename = f"herhealth_analysis_{patient_part}_{timestamp}.pdf"
+        
+        # Return PDF as download
+        return StreamingResponse(
+            io.BytesIO(pdf_buffer.read()),
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": f"attachment; filename={filename}",
+                "Content-Type": "application/pdf"
+            }
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[BACKEND] PDF generation error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"PDF generation failed: {str(e)}")
 
 @app.post("/api/v1/export-pdf")
 async def export_pdf():
-    """Export report as PDF (placeholder)"""
+    """Legacy endpoint - redirects to generate-report"""
+    return JSONResponse({
+        'message': 'Use /api/v1/generate-report endpoint for PDF generation',
+        'redirect': '/api/v1/generate-report'
+    })
+
+
+@app.get("/api/oldpreds/{id}/pdf")
+async def download_old_prediction_pdf(id: str):
+    """Generate and download a PDF report for a stored prediction.
+
+    This reuses the existing PDF generation pipeline but fills the
+    analysis payload from the MongoDB document instead of requiring
+    the raw image upload again.
+    """
     try:
-        return JSONResponse({
-            'pdf_url': '/downloads/report.pdf',
-            'filename': 'cervical_analysis_report.pdf'
-        })
+        if db is None:
+            raise HTTPException(status_code=500, detail="Database is not initialized")
+
+        try:
+            oid = ObjectId(id)
+        except Exception:
+            return JSONResponse({"error": "Invalid id format"}, status_code=400)
+
+        def _fetch_one():
+            return db.predictions.find_one({"_id": oid})
+
+        record = await run_in_threadpool(_fetch_one)
+        if not record:
+            return JSONResponse({"error": "Record not found"}, status_code=404)
+
+        # Normalize record into the same analysis payload used for live reports
+        analysis_data = _build_analysis_payload_from_record(record)
+
+        # Use patient metadata directly from the stored MongoDB record
+        patient_metadata = {
+            'patient_id': record.get('patient_id'),
+            'patient_name': record.get('patient_name', 'Anonymous'),
+            'analysis_date': (
+                record.get('timestamp').strftime('%Y-%m-%d')
+                if isinstance(record.get('timestamp'), datetime)
+                else datetime.utcnow().strftime('%Y-%m-%d')
+            ),
+        }
+
+        # For historical reports we may not have the original file, so pass None
+        # (the PDF generator only uses this for filename metadata)
+        pdf_buffer = generate_pdf_report(analysis_data, patient_metadata, None)
+
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        patient_part = patient_metadata.get('patient_id', 'unknown').replace(' ', '_') if patient_metadata.get('patient_id') else 'anonymous'
+        filename = f"herhealth_analysis_{patient_part}_{timestamp}.pdf"
+
+        return StreamingResponse(
+            io.BytesIO(pdf_buffer.read()),
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": f"attachment; filename={filename}",
+                "Content-Type": "application/pdf",
+            },
+        )
+
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"[BACKEND] Historical PDF generation error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Historical PDF generation failed: {str(e)}")
 
 # ============================================================================
 # MAIN
