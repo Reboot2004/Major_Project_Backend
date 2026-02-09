@@ -1,0 +1,83 @@
+# Git files
+.git
+.gitignore
+.gitattributes
+.github
+
+# Environment files (keep .env.example, ignore actual .env)
+.env
+.env.local
+.env.*.local
+
+# Python cache and artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Documentation and markdown
+*.md
+README.md
+QUICKSTART.md
+
+# Java/Maven artifacts (legacy)
+target/
+pom.xml
+src/
+.mvn/
+
+# Test files
+tests/
+test_*.py
+*_test.py
+pytest_cache/
+
+# Logs
+*.log
+logs/
+
+# Docker files
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+
+# Notebooks and data
+*.ipynb
+*.csv
+*.json
+archive/
+
+# Shell scripts (keep run.sh if needed)
+*.sh
+!run.sh

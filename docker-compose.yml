@@ -1,0 +1,36 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: herhealth-backend:latest
+    container_name: herhealth-backend
+    ports:
+      - "8000:8000"
+    environment:
+      - PORT=8000
+      - CONVNEXT_MODEL_PATH=/app/convnext_best_f1_0.9853.pt
+      - UNET_MODEL_PATH=/app/best_unet.pth
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
+        reservations:
+          cpus: '1'
+          memory: 2G
+    networks:
+      - herhealth-network
+
+networks:
+  herhealth-network:
+    driver: bridge

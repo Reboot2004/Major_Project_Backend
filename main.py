@@ -10,6 +10,10 @@ import time
 from datetime import datetime
 from typing import Dict, List, Optional
 import sys
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 import numpy as np
 import torch
@@ -57,6 +61,60 @@ CLASSES = [
 # Model paths
 CONVNEXT_PATH = os.environ.get('CONVNEXT_MODEL_PATH', 'convnext_best_f1_0.9853.pt')
 UNET_PATH = os.environ.get('UNET_MODEL_PATH', 'best_unet.pth')
+
+# MongoDB configuration
+MONGO_URI = os.environ.get('MONGO_URI')
+PORT = int(os.environ.get('PORT', 7860))
+ENVIRONMENT = os.environ.get('ENVIRONMENT', 'development')
+
+# Initialize MongoDB client (lazy, only if MONGO_URI is set)
+mongo_client = None
+mongo_db = None
+
+def get_mongo_connection():
+    """Get MongoDB connection if configured"""
+    global mongo_client, mongo_db
+    if not MONGO_URI:
+        return None
+    
+    if mongo_client is None:
+        try:
+            from pymongo import MongoClient
+            mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+            # Verify connection
+            mongo_client.admin.command('ping')
+            mongo_db = mongo_client.herhealth
+            print(f'[BACKEND] ✓ MongoDB connected')
+        except Exception as e:
+            print(f'[BACKEND] ✗ MongoDB connection failed: {e}')
+            mongo_client = None
+            mongo_db = None
+    
+    return mongo_db
+
+def save_analysis_to_db(analysis_data: Dict):
+    """Save analysis results to MongoDB"""
+    try:
+        db = get_mongo_connection()
+        if db is None:
+            return False
+        
+        analysis_data['timestamp'] = datetime.utcnow()
+        analysis_data['_id'] = str(uuid.uuid4())
+        
+        db.analyses.insert_one(analysis_data)
+        print(f'[BACKEND] Analysis saved to MongoDB: {analysis_data["_id"]}')
+        return True
+    except Exception as e:
+        print(f'[BACKEND] Failed to save analysis: {e}')
+        return False
+
+print(f'[BACKEND] Environment: {ENVIRONMENT}')
+print(f'[BACKEND] Port: {PORT}')
+if MONGO_URI:
+    print(f'[BACKEND] MongoDB: Configured (will connect on demand)')
+else:
+    print(f'[BACKEND] MongoDB: Not configured (optional)')
 
 # Create FastAPI app
 app = FastAPI(
@@ -1007,7 +1065,8 @@ async def export_pdf():
 # ============================================================================
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 8000))
-    print(f'\n[BACKEND] Starting FastAPI server on http://0.0.0.0:{port}')
-    print(f'[BACKEND] API documentation: http://localhost:{port}/docs\n')
-    uvicorn.run(app, host='0.0.0.0', port=port)
+    print(f'\n[BACKEND] Starting FastAPI server on http://0.0.0.0:{PORT}')
+    print(f'[BACKEND] API documentation: http://localhost:{PORT}/docs\n')
+    if MONGO_URI:
+        get_mongo_connection()  # Establish connection on startup
+    uvicorn.run(app, host='0.0.0.0', port=PORT)
